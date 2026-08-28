@@ -1,0 +1,191 @@
+name: Build sing-box and Update Geo Rules
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.compare_versions.outputs.should_build }}
+      version: ${{ steps.compare_versions.outputs.version }}
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare local and upstream versions
+        id: compare_versions
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+
+          echo "Target Tag: $LATEST_TAG"
+          echo "version=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+          CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+
+          if [ "$CURRENT_TAG" == "$LATEST_TAG" ]; then
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  update-geo-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout rule-set branch
+        uses: actions/checkout@v4
+        with:
+          ref: rule-set
+          path: rule-branch
+
+      - name: Checkout geodat2srs tool
+        uses: actions/checkout@v4
+        with:
+          repository: runetfreedom/geodat2srs
+          path: geodat2srs
+
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Download and compile SRS rules
+        run: |
+          curl -sSL https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/geoip.dat > geoip.dat
+          curl -sSL https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/geosite.dat > geosite.dat
+
+          go build -C geodat2srs ./
+
+          mkdir -p rule-branch/geoip rule-branch/geosite
+          ./geodat2srs/geodat2srs geoip -i geoip.dat -o rule-branch/geoip/
+          ./geodat2srs/geodat2srs geosite -i geosite.dat -o rule-branch/geosite/
+
+          rm -rf geodat2srs geoip.dat geosite.dat
+
+      - name: Flatten directory structure
+        run: |
+          find rule-branch/geoip -mindepth 2 -type f -name "*.srs" -exec mv -t rule-branch/geoip/ {} +
+          find rule-branch/geosite -mindepth 2 -type f -name "*.srs" -exec mv -t rule-branch/geosite/ {} +
+
+          find rule-branch/geoip -mindepth 1 -type d -empty -delete
+          find rule-branch/geosite -mindepth 1 -type d -empty -delete
+
+      - name: Commit and push updated rules
+        run: |
+          cd rule-branch
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add .
+
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: refresh geo-rules $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin rule-set
+          fi
+
+  compile-binaries:
+    needs: check-updates
+    if: needs.check-updates.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64, ext: "" }
+          - { os: windows, arch: amd64, ext: ".exe" }
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Checkout source code of target sing-box version
+        run: |
+          git clone https://github.com/SagerNet/sing-box sing-box-src --depth 1 --branch "${{ needs.check-updates.outputs.version }}"
+
+      - name: Build sing-box binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          cd sing-box-src
+
+          TAGS="with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0"
+          LDFLAGS_SHARED="-X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0"
+
+          echo "Building for $GOOS/$GOARCH with CGO_ENABLED=$CGO_ENABLED"
+          echo "Tags: ${TAGS}"
+
+          go build -v -trimpath -o "sing-box-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}" -tags "${TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.check-updates.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+      - name: Package compiled binary into ZIP archive
+        run: |
+          cd sing-box-src
+          zip "../sing-box-${{ matrix.os }}-${{ matrix.arch }}-${{ needs.check-updates.outputs.version }}.zip" sing-box-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+
+      - name: Upload archive to workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-${{ matrix.os }}-${{ matrix.arch }}
+          path: sing-box-${{ matrix.os }}-${{ matrix.arch }}-${{ needs.check-updates.outputs.version }}.zip
+
+  publish-github-release:
+    needs: [check-updates, compile-binaries]
+    if: needs.check-updates.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repository branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Create directory for release assets
+        run: mkdir -p release-assets
+
+      - name: Download all compiled build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: compiled-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Update repository tags
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git tag -f ${{ needs.check-updates.outputs.version }}
+          git push origin ${{ needs.check-updates.outputs.version }} -f
+
+      - name: Fetch upstream Release Notes
+        run: |
+          VERSION="${{ needs.check-updates.outputs.version }}"
+          curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${VERSION}" | jq -r '.body // ""' > release_notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-updates.outputs.version }}
+          name: "Release ${{ needs.check-updates.outputs.version }}"
+          body_path: release_notes.md
+          files: release-assets/*
