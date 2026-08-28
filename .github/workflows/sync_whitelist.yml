@@ -1,0 +1,98 @@
+name: Sync Whitelist
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Sync
+        shell: python
+        run: |
+          import requests
+          import re
+          from collections import defaultdict
+          from datetime import datetime
+
+          timestamp = datetime.now().strftime("%d.%m.%H")
+          sources = [
+            "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt",
+            "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt",
+            "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt",
+            "https://raw.githubusercontent.com/ByeWhiteLists/ByeWhiteLists2/refs/heads/main/ByeWhiteLists2.txt"
+          ]
+
+          raw_nodes = []
+          for src in sources:
+            try:
+              r = requests.get(src, timeout=20)
+              if r.status_code == 200:
+                raw_nodes.extend([
+                  l for l in r.text.splitlines()
+                  if any(l.startswith(p) for p in ["vless://", "vmess://", "trojan://", "ss://", "hysteria2://"])
+                ])
+            except Exception:
+              pass
+
+          countries_db = {
+            "ru": ("🇷🇺", "Россия"), "de": ("🇩🇪", "Германия"), "nl": ("🇳🇱", "Нидерланды"), "fi": ("🇫🇮", "Финляндия"), 
+            "us": ("🇺🇸", "США"), "fr": ("🇫🇷", "Франция"), "gb": ("🇬🇧", "Великобритания"), "uk": ("🇬🇧", "Великобритания"),
+            "sg": ("🇸🇬", "Сингапур"), "jp": ("🇯🇵", "Япония"), "hk": ("🇭🇰", "Гонконг"), "tr": ("🇹🇷", "Турция"), 
+            "pl": ("🇵🇱", "Польша"), "ua": ("🇺🇦", "Украина"), "kz": ("🇰🇿", "Казахстан"), "se": ("🇸🇪", "Швеция"), 
+            "ch": ("🇨🇭", "Швейцария"), "it": ("🇮🇹", "Италия"), "es": ("🇪🇸", "Испания"), "ca": ("🇨🇦", "Канада"), 
+            "au": ("🇦🇺", "Австралия"), "at": ("🇦🇹", "Австрия"), "cz": ("🇨🇿", "Чехия"), "bg": ("🇧🇬", "Болгария"), 
+            "ro": ("🇷🇴", "Румыния"), "hu": ("🇭🇺", "Венгрия"), "ee": ("🇪🇪", "Эстония"), "lv": ("🇱🇻", "Латвия"), 
+            "lt": ("🇱🇹", "Литва"), "kr": ("🇰🇷", "Южная Корея"), "in": ("🇮🇳", "Индия"), "br": ("🇧🇷", "Бразилия"), 
+            "ae": ("🇦🇪", "ОАЭ"), "cy": ("🇨🇾", "Кипр"), "ge": ("🇬🇪", "Грузия"), "md": ("🇲🇩", "Молдова")
+          }
+
+          seen_urls = set()
+          grouped = defaultdict(list)
+
+          for node in raw_nodes:
+            base = node.split("#")[0].strip()
+            if base in seen_urls:
+              continue
+            for code, data in countries_db.items():
+              if re.search(rf"\b{code}\b|{data[1].lower()[:4]}", node.lower()):
+                seen_urls.add(base)
+                grouped[data[1]].append((base, data[0]))
+                break
+
+          total = sum(len(nodes) for nodes in grouped.values())
+
+          final = [
+            "#announce: 🔰 Tap the speedometer or lightning icon to test latency. Lower ms is better | n/a means dead node. If the VPN is slow, tap 🔄️.",
+            "#profile-web-page-url: https://github.com/d43m0n4rch7/sing-box-forge",
+            f"#profile-title: 🏳️ SBF | Anti-Block All [{timestamp}]",
+            f"#profile-update-interval: 1",
+            f"#last-update: {timestamp}",
+            f"#count: {total}"
+          ]
+
+          for country in sorted(grouped.keys()):
+            for i, (base, flag) in enumerate(grouped[country], 1):
+              final.append(f"{base}#{flag} SBF {country} | #{i}")
+
+          with open("whitelist_all.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(final))
+
+      - name: Push
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add whitelist_all.txt
+          git commit -m "sync: whitelist all" || exit 0
+          git push
